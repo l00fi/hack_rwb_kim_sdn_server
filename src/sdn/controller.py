@@ -1,61 +1,63 @@
-# файл: pox/ext/learning.py
+# файл: pox/ext/controller.py
 
-from pox.core import core
+from pox.core import core, getLogger
 import pox.openflow.libopenflow_01 as of
+from pox.openflow import openflow
 
-log = core.getLogger()
+# логгер нашего модуля
+log = getLogger("sdn.controller")
+log.setLevel("DEBUG")
 
 class LearningSwitch (object):
     def __init__ (self, connection):
-        # connection — объект, связывающий этот контроллер с одним OpenFlow свитчем
         self.connection = connection
-        # таблица MAC → порт
         self.mac_to_port = {}
-
-        # подписываемся на событие PacketIn
         connection.addListeners(self)
 
     def _handle_PacketIn (self, event):
-        """
-        Обрабатываем приходящий Ethernet‑пакет.
-        """
         packet = event.parsed
         in_port = event.port
+        src, dst = packet.src, packet.dst
 
-        src = packet.src
-        dst = packet.dst
-
-        # 1) учим, что src видно на in_port
+        # учим MAC → порт
         self.mac_to_port[src] = in_port
-        log.debug("Свитч %s: запомним MAC %s → порт %s", 
+        log.debug("Switch %s: learned %s → port %s",
                   event.connection.dpid, src, in_port)
 
-        # 2) куда флоуить dst?
         if dst in self.mac_to_port:
             out_port = self.mac_to_port[dst]
-            log.debug("Форвардим пакет %s → %s на порт %s", src, dst, out_port)
-            # создаём правило и сразу же отправляем пакет по нему
+            log.debug("Forwarding %s → %s out port %s", src, dst, out_port)
             msg = of.ofp_flow_mod()
             msg.match = of.ofp_match.from_packet(packet, in_port)
-            msg.idle_timeout = 10   # удалить правило через 10 с бездействия
-            msg.hard_timeout = 30   # жить не дольше 30 с
-            msg.actions.append(of.ofp_action_output(port = out_port))
+            msg.idle_timeout = 10
+            msg.hard_timeout = 30
+            msg.actions.append(of.ofp_action_output(port=out_port))
             event.connection.send(msg)
         else:
-            # неизвестный dst — флудим на все порты, кроме входного
-            log.debug("MAC %s неизвестен, флудим", dst)
+            log.debug("Unknown dst %s — flooding", dst)
             msg = of.ofp_packet_out()
-            msg.data = event.ofp  # оригинальный пакет
-            msg.actions.append(of.ofp_action_output(port = of.OFPP_FLOOD))
+            msg.data = event.ofp
+            msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
             msg.in_port = in_port
             event.connection.send(msg)
 
+def launch (port="6633"):
+    """
+    Запускаем OpenFlow‑слушатель на 0.0.0.0:port и регистрируем
+    обработчик ConnectionUp → LearningSwitch.
+    Параметр port можно передать через командную строку:
 
-def launch ():
+      ./pox.py controller --port=6653
     """
-    Точка входа в приложение. Запускается автоматически при ./pox.py learning
-    """
+    port = int(port)
+    log.info("Starting SDN controller on 0.0.0.0:%s", port)
+
+    # 1) говорим встроенному сервису OpenFlow слушать этот порт
+    openflow.listen("0.0.0.0", port)
+
+    # 2) навешиваем обработчик новых подключений
     def start_switch (event):
-        log.info("Новый свитч подключился: %s", event.connection)
+        log.info("New switch connected: %s", event.connection)
         LearningSwitch(event.connection)
+
     core.openflow.addListenerByName("ConnectionUp", start_switch)
